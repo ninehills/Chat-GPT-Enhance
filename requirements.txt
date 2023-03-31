@@ -1,0 +1,7 @@
+langchain
+openai
+gradio
+requests
+google-search-results
+wolframalpha
+wikipedia
