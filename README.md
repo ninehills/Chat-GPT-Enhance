@@ -7,9 +7,14 @@ Empower ChatGPT with the ability to perform mathematical calculations, web scrap
 ## TODO
 
 - [ ] Local storage
-- [ ] web scraping
+- [x] web scraping
+    - [x] 弃用，requests，问题：没有对 html标签进行处理
 - [ ] One-click deployments.
 - [ ] PDF/Markdown analysis.
+
+问题：
+
+需要给 LLMChain 增加 token 限制
 
 ## Credits
 

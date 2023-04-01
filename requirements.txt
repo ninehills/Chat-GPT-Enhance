@@ -2,6 +2,7 @@ langchain
 openai
 gradio
 requests
+inscriptis
 google-search-results
 wolframalpha
-wikipedia
+tiktoken

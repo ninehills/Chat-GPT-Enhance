@@ -2,19 +2,19 @@ import io
 import os
 import ssl
 from contextlib import closing
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any, Dict
 import datetime
 
 import gradio as gr
 import requests
-
-import openai
+import inscriptis
 
 from langchain import ConversationChain, LLMChain
 
-from langchain.agents import load_tools, initialize_agent
+from langchain.agents import initialize_agent, Tool, load_tools
 from langchain.chains.conversation.memory import ConversationBufferMemory
 from langchain.chat_models import ChatOpenAI
+from langchain.llms import OpenAIChat, OpenAI
 from threading import Lock
 
 # Console to variable
@@ -34,9 +34,37 @@ from langchain.vectorstores.faiss import FAISS
 from langchain.docstore.document import Document
 from langchain.chains.question_answering import load_qa_chain
 
+from langchain.utilities import GoogleSerperAPIWrapper
+from langchain.utilities.wolfram_alpha import WolframAlphaAPIWrapper
+from langchain.tools.wolfram_alpha.tool import WolframAlphaQueryRun
+from langchain.utilities import ApifyWrapper
+from langchain.tools import BaseTool
+
 MAX_TOKENS = 512
 
-def update_settings(use_gpt4, tools, serper_api_key, wolfram_alpha_appid):
+class WebCrawlerTool(BaseTool):
+    name = "web_crawler"
+    description = "A portal to the internet. Use this when you need to get specific content from a website. Input should be a  url (i.e. https://www.google.com). The output will be the text response of the GET request."
+
+    headers: Optional[Dict[str, str]] = None
+
+    def _run(self, url: str) -> str:
+        """Use the tool."""
+        html = self._get(url, timeout=10)
+        return inscriptis.get_text(html)
+
+    async def _arun(self, url: str) -> str:
+        """Use the tool asynchronously."""
+        raise NotImplementedError("WebCrawlerTool does not support async")
+
+    def _get(self, url: str, **kwargs: Any) -> str:
+        """GET the URL and return the text."""
+        return requests.get(url, headers=self.headers, **kwargs).text
+
+
+def update_settings(use_gpt4, tools, openai_api_key, serper_api_key, wolfram_alpha_appid):
+    if openai_api_key:
+        os.environ["OPENAI_API_KEY"] = openai_api_key
     if serper_api_key:
         os.environ["SERPER_API_KEY"] = serper_api_key
     if wolfram_alpha_appid:
@@ -48,7 +76,27 @@ def update_settings(use_gpt4, tools, serper_api_key, wolfram_alpha_appid):
         print("Trying to use llm OpenAI with gpt-3.5-turbo")
         llm = ChatOpenAI(temperature=0, max_tokens=MAX_TOKENS, model_name="gpt-3.5-turbo")
     
-    chain, express_chain, memory = load_chain(tools, llm)
+    tools_list = []
+    for tool in tools:
+        print("Load tool: ", tool)
+        if tool == "google-serper'":
+            t = Tool(
+                name="Serper Search",
+                func=GoogleSerperAPIWrapper(serper_api_key=serper_api_key).run,
+                description="A low-cost Google Search API. Useful for when you need to answer questions about current events. Input should be a search query.",
+            )
+        elif tool == "wolfram-alpha":
+            t = WolframAlphaQueryRun(api_wrapper=WolframAlphaAPIWrapper(wolfram_alpha_appid=wolfram_alpha_appid))
+        elif tool == "web_crawler":
+            t = WebCrawlerTool()
+        else:
+            raise ValueError("Tool not found: " + tool)
+        tools_list.append(t)
+
+    # memory = ConversationBufferMemory(memory_key="chat_history")
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    chain = initialize_agent(tools_list, llm, agent="chat-conversational-react-description", verbose=True, memory=memory)
+    express_chain = LLMChain(llm=llm, prompt=PROMPT_TEMPLATE, verbose=True)
     return chain, express_chain, memory
 
 
@@ -57,14 +105,12 @@ class ChatWrapper:
         self.lock = Lock()
 
     def __call__(
-            self, openai_api_key: str, inp: str, history: Optional[Tuple[str, str]], chain: Optional[ConversationChain],
+            self, inp: str, history: Optional[Tuple[str, str]], chain: Optional[ConversationChain],
             trace_chain: bool, monologue: bool, express_chain: Optional[LLMChain],
-            translate_to, force_translate
+            translate_to: str, force_translate: bool
     ):
         """Execute the chat functionality."""
         self.lock.acquire()
-
-        openai.api_key = openai_api_key
         try:
             print("\n==== date/time: " + str(datetime.datetime.now()) + " ====")
             print("inp: " + inp)
@@ -97,7 +143,7 @@ class ChatWrapper:
         return history, history, ""
 
 
-def run_chain(chain, inp, capture_hidden_text):
+def run_chain(chain: LLMChain, inp: str, capture_hidden_text: bool):
     output = ""
     hidden_text = None
     if capture_hidden_text:
@@ -114,6 +160,8 @@ def run_chain(chain, inp, capture_hidden_text):
         except RateLimitError as rle:
             error_msg = "\n\nRateLimitError: " + str(rle)
         except ValueError as ve:
+            import traceback
+            traceback.print_exc()
             error_msg = "\n\nValueError: " + str(ve)
         except InvalidRequestError as ire:
             error_msg = "\n\nInvalidRequestError: " + str(ire)
@@ -160,21 +208,6 @@ def run_chain(chain, inp, capture_hidden_text):
 
     return output, hidden_text
 
-def load_chain(tools_list, llm):
-    chain = None
-    express_chain = None
-    memory = None
-    if llm:
-        print("\ntools_list", tools_list)
-        tool_names = tools_list
-        tools = load_tools(tool_names, llm=llm)
-
-        memory = ConversationBufferMemory(memory_key="chat_history")
-
-        chain = initialize_agent(tools, llm, agent="conversational-react-description", verbose=True, memory=memory)
-        express_chain = LLMChain(llm=llm, prompt=PROMPT_TEMPLATE, verbose=True)
-    return chain, express_chain, memory
-
 
 TRANSLATE_TO_DEFAULT = "N/A"
 PROMPT_TEMPLATE = PromptTemplate(
@@ -183,7 +216,7 @@ PROMPT_TEMPLATE = PromptTemplate(
 )
 
 # Pertains to Express-inator functionality
-def transform_text(desc: str, express_chain, translate_to: str, force_translate: bool):
+def transform_text(desc: str, express_chain: LLMChain, translate_to: str, force_translate: bool):
     translate_to_str = ""
     if translate_to != TRANSLATE_TO_DEFAULT and force_translate:
         translate_to_str = "translated to " + translate_to + ", "
